@@ -10,6 +10,7 @@ import os
 import warnings
 import joblib 
 import cv2  
+import pickle
 from sklearn.base import BaseEstimator, ClassifierMixin 
 from sklearn.svm import SVC 
 
@@ -21,7 +22,7 @@ warnings.filterwarnings('ignore')
 # Đường dẫn cho cả hai mô hình
 MODEL_PATHS = {
     "ViT (Vision Transformer)": 'vit_flowers_model.weights.h5',
-    "BoVW + SIFT + HSV (SVM)": 'bovw_sift_hsv_model.pkl' 
+    "BoVW + SIFT + HSV (SVM)": 'bovw_sift_hsv_svm.pkl' 
 }
 
 # Tham số Kích thước ảnh đầu vào (Phải khớp với ViT và BoVW)
@@ -57,52 +58,82 @@ for name, path in MODEL_PATHS.items():
 # 2. HÀM TRÍCH XUẤT ĐẶC TRƯNG BOVW (Cho mô hình SVM)
 # =================================================================
 
-def extract_bovw_features(image_cv, kmeans_model, k_clusters):
-    """
-    Thực hiện trích xuất SIFT và Color Histogram (HSV), sau đó tạo vector BoVW.
-    image_cv: Ảnh đã resize (dùng cv2.resize) ở định dạng BGR.
-    """
-    
-    # Chuyển đổi ảnh sang ảnh xám cho SIFT
-    gray_image = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-
-    # 1. SIFT Extraction
+def extract_rootsift_descriptors(img_gray, max_kp=500):
     sift = cv2.SIFT_create()
-    keypoints, descriptors = sift.detectAndCompute(gray_image, None)
-    
-    # 2. BoVW Histogram
-    if descriptors is None or len(descriptors) == 0:
-        # Kích thước phải là K_CLUSTERS + 9 (cho HSV)
-        return np.zeros((1, k_clusters + 9), dtype=np.float32) 
-    
-    # Quantize SIFT descriptors
-    try:
-        # Sử dụng KMeans để quantize (gán cụm) descriptors
-        clusters = kmeans_model.predict(descriptors)
-    except AttributeError:
-        # Lỗi này chỉ xảy ra nếu KMeans không phải là mô hình Scikit-learn hợp lệ
-        # Nếu gặp lỗi này, hãy kiểm tra lại Kmeans Model được lưu
-        st.error("Lỗi: Mô hình KMeans không có phương thức predict. Không thể trích xuất SIFT.")
-        return np.zeros((1, k_clusters + 9), dtype=np.float32) 
-        
-    bovw_hist, _ = np.histogram(clusters, bins=range(k_clusters + 1), density=True)
-    
-    # 3. HSV Color Histogram (9 features: 3 bins per H, S, V)
-    hsv_image = cv2.cvtColor(image_cv, cv2.COLOR_BGR2HSV)
-    # LƯU Ý: Nếu mô hình SVM của bạn chỉ dùng 3 bins cho H, S, V TỔNG CỘNG (tức 1 feature H, 1 feature S, 1 feature V)
-    # thì K_CLUSTERS = 189. Hiện tại, chúng ta dùng 9 features (3 bins cho mỗi kênh)
-    h_hist = cv2.calcHist([hsv_image], [0], None, [3], [0, 180]).flatten()
-    s_hist = cv2.calcHist([hsv_image], [1], None, [3], [0, 256]).flatten()
-    v_hist = cv2.calcHist([hsv_image], [2], None, [3], [0, 256]).flatten()
-    
-    color_hist = np.concatenate([h_hist, s_hist, v_hist])
-    color_hist /= (color_hist.sum() + 1e-7) # Chuẩn hóa màu sắc
-    
-    # 4. Concatenate
-    final_features = np.concatenate([bovw_hist, color_hist])
-    return final_features.reshape(1, -1)
+    keypoints, desc = sift.detectAndCompute(img_gray, None)
+    if desc is None:
+        return None
+    if desc.shape[0] > max_kp:
+        desc = desc[:max_kp]
+    desc = desc.astype("float32")
+    desc /= (desc.sum(axis=1, keepdims=True) + 1e-7)
+    desc = np.sqrt(desc)
+    return desc
 
+def extract_hsv_hist(img_bgr, bins=(4,4,4)):
+    img_resized = cv2.resize(img_bgr, (256, 256))
+    hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
 
+    hist = cv2.calcHist(
+        [hsv], [0,1,2], None,
+        bins,                       # (H,S,V)
+        [0,180, 0,256, 0,256]
+    )
+    hist = hist.astype("float32")
+    hist = hist.flatten()
+    hist /= (hist.sum() + 1e-7)
+    hist = np.sqrt(hist)
+    return hist
+
+def extract_center_hsv_hist(img_bgr, bins=(4,4,4)):
+    h, w = img_bgr.shape[:2]
+    # cắt ô giữa ảnh (ví dụ 1/2 chiều cao, 1/2 chiều rộng)
+    x1, x2 = w//4, 3*w//4
+    y1, y2 = h//4, 3*h//4
+    center = img_bgr[y1:y2, x1:x2]
+
+    hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv],[0,1,2],None,bins,[0,180,0,256,0,256])
+    hist = hist.astype("float32").flatten()
+    hist /= (hist.sum() + 1e-7)
+    hist = np.sqrt(hist)   # Hellinger
+    return hist
+
+def process_image_for_prediction(img_bgr, model_obj):
+    """
+    Trả về feature vector = [BoVW_RootSIFT, HSV_hist]
+    """
+    kmeans, scaler, pca, svm_model, class_names, K = model_obj
+    
+    img_resized = cv2.resize(img_bgr, (256, 256))
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+    # --- BoVW từ RootSIFT ---
+    desc = extract_rootsift_descriptors(gray)
+    if desc is None:
+        bovw_hist = np.zeros(K, dtype=np.float32)
+    else:
+        words = kmeans.predict(desc)
+        bovw_hist, _ = np.histogram(words, bins=np.arange(K+1))
+        bovw_hist = bovw_hist.astype("float32")
+        # Hellinger
+        bovw_hist /= (bovw_hist.sum() + 1e-7)
+        bovw_hist = np.sqrt(bovw_hist)
+
+    # --- HSV color feature ---
+    global_hsv = extract_hsv_hist(img_resized, bins=(4,4,4))  # 64 dims
+    center_hsv = extract_center_hsv_hist(img_resized, bins=(4,4,4))
+    
+    # Gộp
+    feat = np.hstack([bovw_hist, global_hsv, center_hsv])
+    
+    # Reshape (1, N) để đưa vào scaler
+    feat = feat.reshape(1, -1)
+    
+    # Scale & PCA
+    feat_scaled = scaler.transform(feat)
+    feat_pca = pca.transform(feat_scaled)
+
+    return feat_pca
 # =================================================================
 # 3. KIẾN TRÚC VIT VÀ HÀM TẢI MÔ HÌNH
 # =================================================================
@@ -226,54 +257,16 @@ def load_model(model_name):
             
     elif model_name.startswith("BoVW"):
         try:
-            bovw_obj = joblib.load(path)
-            
-            # Khởi tạo giá trị mặc định
-            kmeans_model = None
-            svm_classifier = None
-            
-            # --- XỬ LÝ LỖI BOVW (Phát hiện đối tượng dict) ---
-            if isinstance(bovw_obj, dict):
-                st.info("Phát hiện: File PKL chứa đối tượng `dict`. Đang tìm kiếm KMeans và SVM theo khóa...")
-                
-                # Cơ chế tìm kiếm linh hoạt trong dict
-                found_kmeans = False
-                found_svm = False
-                
-                for key, obj in bovw_obj.items():
-                    # Tìm KMeans (có predict và tên chứa 'kmeans')
-                    if hasattr(obj, 'predict') and obj.__class__.__name__.lower().find('kmeans') != -1:
-                        kmeans_model = obj
-                        found_kmeans = True
-                    # Tìm SVM/Pipeline (có predict và tên chứa 'svc' hoặc 'pipeline')
-                    elif hasattr(obj, 'predict') and (obj.__class__.__name__.lower().find('svc') != -1 or obj.__class__.__name__.lower().find('pipeline') != -1):
-                        svm_classifier = obj
-                        found_svm = True
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            kmeans = data["kmeans"]
+            scaler = data["scaler"]
+            pca = data["pca"]
+            svm_model = data["model"]
+            class_names = data["class_names"]
+            K = data["K_value"]
 
-                if found_kmeans and found_svm:
-                    return (kmeans_model, svm_classifier)
-                elif found_kmeans and not found_svm:
-                    st.warning("CẢNH BÁO BOVW: Phát hiện KMeans, nhưng SVM Classifier bị thiếu trong dict.")
-                    return (kmeans_model, None) # Trả về tuple (KMeans, None)
-                else:
-                    st.error(f"Lỗi BoVW: Không tìm thấy KMeans và/hoặc SVM Classifier trong dict. Các khóa trong dict: {list(bovw_obj.keys())}")
-                    return None
-            
-            # Trường hợp 2: Tuple (KMeans, SVM)
-            elif isinstance(bovw_obj, tuple) and len(bovw_obj) == 2 and hasattr(bovw_obj[1], 'predict'):
-                st.info("Phát hiện: Tuple (KMeans, SVM). Sử dụng cả hai.")
-                return bovw_obj
-            
-            # Trường hợp 3: Chỉ có KMeans (Dựa trên lỗi trước)
-            elif hasattr(bovw_obj, 'predict') and bovw_obj.__class__.__name__.lower().find('kmeans') != -1:
-                st.warning("CẢNH BÁO BOVW: Phát hiện chỉ có Mô hình KMeans (Từ vựng). Không có SVM Classifier.")
-                return (bovw_obj, None)
-            
-            # Các trường hợp lỗi khác
-            else:
-                class_name_actual = bovw_obj.__class__.__name__
-                st.error(f"Cấu trúc file .pkl BoVW không xác định. Đối tượng là loại `{class_name_actual}`. Vui lòng kiểm tra lại quá trình lưu mô hình.")
-                return None
+            return (kmeans, scaler, pca, svm_model, class_names, K)
                  
         except Exception as e:
             st.error(f"Lỗi Tải Mô Hình BoVW: {e}. Vui lòng kiểm tra lại cấu trúc file .pkl.")
@@ -284,12 +277,12 @@ def load_model(model_name):
 # --- HÀM DỰ ĐOÁN CHUNG ---
 def predict_image(model_name, model_obj, image, size, class_names):
     
-    # 1. Tiền xử lý ảnh PIL (Resize & RGB)
-    img_resized = image.resize((size, size)).convert('RGB')
+    results = []
     
     if model_name.startswith("ViT"):
         # ********* LOGIC DỰ ĐOÁN VIT *********
-        
+        img_resized = image.resize((size, size)).convert('RGB')
+
         img_array = keras.preprocessing.image.img_to_array(img_resized) 
         img_array = np.expand_dims(img_array, axis=0) 
         img_array = img_array / 255.0 
@@ -301,43 +294,19 @@ def predict_image(model_name, model_obj, image, size, class_names):
         
     elif model_name.startswith("BoVW"):
         # ********* LOGIC DỰ ĐOÁN BOVW *********
-        
-        # model_obj có thể là (KMeans, SVM) hoặc (KMeans, None)
-        kmeans_model, svm_or_pipeline = model_obj
-        
-        # --- KIỂM TRA MÔ HÌNH THIẾU ---
-        if svm_or_pipeline is None:
-            # Thông báo lỗi đã được in ở giao diện bởi load_model, chỉ trả về 0
-            return [{'class': c, 'probability': 0.0} for c in class_names]
+        # kmeans, scaler, pca, svm_model, class_names, K = model_obj
             
         # Chuyển đổi PIL sang cv2 (numpy BGR)
-        img_cv_rgb = np.array(img_resized)
-        img_cv_bgr = cv2.cvtColor(img_cv_rgb, cv2.COLOR_RGB2BGR)
+        img_array = np.array(image.convert('RGB')) # Đảm bảo là RGB trước khi sang numpy
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
         
-        # --- QUY TRÌNH TRÍCH XUẤT FEATURES (Chỉ khi có KMeans) ---
-        if kmeans_model is not None:
-            # Trích xuất SIFT + BoVW thủ công
-            features = extract_bovw_features(img_cv_bgr, kmeans_model, K_CLUSTERS)
-        else:
-            # Trường hợp lỗi thiếu KMeans (đã được xử lý trong load_model)
-            st.error("LỖI BOVW: Không có KMeans/Từ vựng để trích xuất SIFT/BoVW features.")
-            return [{'class': c, 'probability': 0.0} for c in class_names]
+        # --- TRÍCH XUẤT ĐẶC TRƯNG BOVW + HSV ---
+        features = process_image_for_prediction(img_bgr, model_obj)
             
         # --- THỰC HIỆN DỰ ĐOÁN ---
-        if features is not None and features.shape[1] == (K_CLUSTERS + 9):
-            prediction_index = svm_or_pipeline.predict(features)[0]
-            
-            if hasattr(svm_or_pipeline, 'predict_proba'):
-                probabilities = svm_or_pipeline.predict_proba(features)[0]
-            else:
-                probabilities = np.zeros(len(class_names))
-                probabilities[prediction_index] = 1.0
+        probabilities = model_obj[3].predict_proba(features)[0]
 
-            results = [{'class': name, 'probability': prob} for name, prob in zip(class_names, probabilities)]
-        else:
-             st.error(f"Lỗi Dự đoán BoVW: Kích thước vector features không khớp ({features.shape[1]} != {K_CLUSTERS + 9}).")
-             return [{'class': c, 'probability': 0.0} for c in class_names]
-        
+        results = [{'class': name, 'probability': prob} for name, prob in zip(class_names, probabilities)]   
     return results
 
 
