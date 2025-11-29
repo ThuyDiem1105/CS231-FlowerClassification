@@ -23,7 +23,7 @@ FEATURE_EXTRACTOR_WEIGHTS_PATH = 'feature_extractor.weights.h5'
 SVM_MODEL_PATH = 'svm_classifier.pkl'
 SCALER_PATH = 'feature_scaler.pkl'
 # CẬP NHẬT CLASS NAMES CỦA BẠN (7 LỚP)
-CLASS_NAMES = ['daisy', 'dandelion', 'rose', 'sunflower', 'tulip', 'class_5', 'class_6'] 
+CLASS_NAMES = ['daisy', 'dandelion', 'rose', 'sunflower', 'tulip', 'lily', 'orchid'] 
 
 # =================================================================
 # 2. ĐỊNH NGHĨA LỚP BỌC (Tái tạo kiến trúc ViT)
@@ -102,9 +102,11 @@ def load_feature_extractor():
         st.error(f"❌ Lỗi tải ViT weights: {e}")
         return None
 
-@st.cache_data
+@st.cache_resource 
 def load_svm_and_scaler():
     """Tải và cache SVM và Scaler (các đối tượng pickle)."""
+    
+    svm_model, scaler = None, None
     
     # Tải SVM Classifier
     st.write("Đang tải SVM Classifier...")
@@ -128,7 +130,6 @@ def load_svm_and_scaler():
         st.success("Tải StandardScaler thành công!")
     except Exception as e:
         st.error(f"❌ Lỗi tải StandardScaler: {e}")
-        return None, None
         
     return svm_model, scaler
 
@@ -145,7 +146,7 @@ def preprocess_image(image):
 def predict_class(image_tensor, feature_extractor, scaler, svm_model, class_names):
     """Trích xuất features, chuẩn hóa và dự đoán bằng SVM."""
     # Trích xuất Features (chỉ chạy inference)
-    features = feature_extractor.predict(image_tensor, verbose=0)
+    features = feature_extractor(image_tensor, training=True).numpy()
     
     # Chuẩn hóa Features
     features_scaled = scaler.transform(features)
