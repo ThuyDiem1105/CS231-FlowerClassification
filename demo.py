@@ -1,376 +1,226 @@
 import streamlit as st
 import tensorflow as tf
-from tensorflow import keras
 from tensorflow.keras import layers
 import numpy as np
-from PIL import Image
-import io
-import pandas as pd
-import os 
-import warnings
-import joblib 
-import cv2  
 import pickle
-from sklearn.base import BaseEstimator, ClassifierMixin 
-from sklearn.svm import SVC 
-
-warnings.filterwarnings('ignore') 
+from PIL import Image
+import os
+# Import ViTConfig và TFViTModel để tái tạo kiến trúc
+from transformers import ViTConfig, TFViTModel 
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
 
 # =================================================================
-# 1. CẤU HÌNH THAM SỐ (PHẢI KHỚP VỚI LÚC HUẤN LUYỆN)
+# 1. CẤU HÌNH THAM SỐ VÀ KHAI BÁO
 # =================================================================
-# Đường dẫn cho cả hai mô hình
-MODEL_PATHS = {
-    "ViT (Vision Transformer)": 'vit_flowers_model.weights.h5',
-    "BoVW + SIFT + HSV (SVM)": 'bovw_sift_hsv_svm.pkl' 
-}
-
-# Tham số Kích thước ảnh đầu vào (Phải khớp với ViT và BoVW)
 IMG_HEIGHT = 224
 IMG_WIDTH = 224
-IMAGE_SIZE = 224
 INPUT_SHAPE = (IMG_HEIGHT, IMG_WIDTH, 3)
-NUM_CLASSES = 7
-CLASS_NAMES = ['daisy', 'dandelion', 'lily', 'orchid', 'rose', 'sunflower', 'tulip']
+PRETRAINED_MODEL = "google/vit-base-patch16-224"
 
-# Tham số ViT
-PATCH_SIZE = 16
-NUM_PATCHES = 196 
-PROJECTION_DIM = 128
-NUM_HEADS = 4
-TRANSFORMER_LAYERS = 6
-MLP_UNITS = [256, 128]
-MLP_HEAD_UNITS = [128]
-
-# Tham số BoVW
-K_CLUSTERS = 183 # <--- ĐÃ SỬA: 192 (SVM features) - 9 (HSV features) = 183
-# -----------------------------------------------------------------
-
-
-# --- KIỂM TRA ĐƯỜNG DẪN FILE MÔ HÌNH ---
-for name, path in MODEL_PATHS.items():
-    if not os.path.exists(path):
-        st.error(f"LỖI KHỞI TẠO: Không tìm thấy file mô hình `{name}` tại đường dẫn: `{path}`")
-        st.stop()
-
+# Đường dẫn đến các file đã lưu (Kiểm tra lại đường dẫn này!)
+FEATURE_EXTRACTOR_WEIGHTS_PATH = 'feature_extractor.weights.h5'
+SVM_MODEL_PATH = 'svm_classifier.pkl'
+SCALER_PATH = 'feature_scaler.pkl'
+# CẬP NHẬT CLASS NAMES CỦA BẠN (7 LỚP)
+CLASS_NAMES = ['daisy', 'dandelion', 'rose', 'sunflower', 'tulip', 'class_5', 'class_6'] 
 
 # =================================================================
-# 2. HÀM TRÍCH XUẤT ĐẶC TRƯNG BOVW (Cho mô hình SVM)
+# 2. ĐỊNH NGHĨA LỚP BỌC (Tái tạo kiến trúc ViT)
 # =================================================================
-
-def extract_rootsift_descriptors(img_gray, max_kp=500):
-    sift = cv2.SIFT_create()
-    keypoints, desc = sift.detectAndCompute(img_gray, None)
-    if desc is None:
-        return None
-    if desc.shape[0] > max_kp:
-        desc = desc[:max_kp]
-    desc = desc.astype("float32")
-    desc /= (desc.sum(axis=1, keepdims=True) + 1e-7)
-    desc = np.sqrt(desc)
-    return desc
-
-def extract_hsv_hist(img_bgr, bins=(4,4,4)):
-    img_resized = cv2.resize(img_bgr, (256, 256))
-    hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
-
-    hist = cv2.calcHist(
-        [hsv], [0,1,2], None,
-        bins,                       # (H,S,V)
-        [0,180, 0,256, 0,256]
-    )
-    hist = hist.astype("float32")
-    hist = hist.flatten()
-    hist /= (hist.sum() + 1e-7)
-    hist = np.sqrt(hist)
-    return hist
-
-def extract_center_hsv_hist(img_bgr, bins=(4,4,4)):
-    h, w = img_bgr.shape[:2]
-    # cắt ô giữa ảnh (ví dụ 1/2 chiều cao, 1/2 chiều rộng)
-    x1, x2 = w//4, 3*w//4
-    y1, y2 = h//4, 3*h//4
-    center = img_bgr[y1:y2, x1:x2]
-
-    hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv],[0,1,2],None,bins,[0,180,0,256,0,256])
-    hist = hist.astype("float32").flatten()
-    hist /= (hist.sum() + 1e-7)
-    hist = np.sqrt(hist)   # Hellinger
-    return hist
-
-def process_image_for_prediction(img_bgr, model_obj):
-    """
-    Trả về feature vector = [BoVW_RootSIFT, HSV_hist]
-    """
-    kmeans, scaler, pca, svm_model, class_names, K = model_obj
-    
-    img_resized = cv2.resize(img_bgr, (256, 256))
-    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
-    # --- BoVW từ RootSIFT ---
-    desc = extract_rootsift_descriptors(gray)
-    if desc is None:
-        bovw_hist = np.zeros(K, dtype=np.float32)
-    else:
-        words = kmeans.predict(desc)
-        bovw_hist, _ = np.histogram(words, bins=np.arange(K+1))
-        bovw_hist = bovw_hist.astype("float32")
-        # Hellinger
-        bovw_hist /= (bovw_hist.sum() + 1e-7)
-        bovw_hist = np.sqrt(bovw_hist)
-
-    # --- HSV color feature ---
-    global_hsv = extract_hsv_hist(img_resized, bins=(4,4,4))  # 64 dims
-    center_hsv = extract_center_hsv_hist(img_resized, bins=(4,4,4))
-    
-    # Gộp
-    feat = np.hstack([bovw_hist, global_hsv, center_hsv])
-    
-    # Reshape (1, N) để đưa vào scaler
-    feat = feat.reshape(1, -1)
-    
-    # Scale & PCA
-    feat_scaled = scaler.transform(feat)
-    feat_pca = pca.transform(feat_scaled)
-
-    return feat_pca
-# =================================================================
-# 3. KIẾN TRÚC VIT VÀ HÀM TẢI MÔ HÌNH
-# =================================================================
-
-# --- Create Patches ---
-class PatchLayer(layers.Layer):
-    def call(self, images):
-        patches = tf.image.extract_patches(
-            images=images,
-            sizes=[1, PATCH_SIZE, PATCH_SIZE, 1],
-            strides=[1, PATCH_SIZE, PATCH_SIZE, 1],
-            rates=[1, 1, 1, 1],
-            padding="VALID"
-        )
-        patch_dim = PATCH_SIZE * PATCH_SIZE * 3
-        return tf.reshape(patches, [-1, NUM_PATCHES, patch_dim])
-
-# --- Patch Encoder (Linear Projection + Positional Encoding) ---
-class PatchEncoder(layers.Layer):
-    def __init__(self, num_patches=NUM_PATCHES, projection_dim=PROJECTION_DIM, **kwargs):
+class ViTFeatureExtractorLayer(tf.keras.layers.Layer):
+    """Gói TFViTModel. Khởi tạo model từ Config để tránh lỗi loading PyTorch weights."""
+    def __init__(self, model_name=PRETRAINED_MODEL, **kwargs):
         super().__init__(**kwargs)
-        self.num_patches = num_patches
-        self.projection_dim = projection_dim
-        self.projection = layers.Dense(projection_dim)
-        self.position_embedding = layers.Embedding(
-            input_dim=num_patches + 1, 
-            output_dim=projection_dim
-        )
-        
-    def call(self, patch_tokens):
-        positions = tf.range(start=0, limit=self.num_patches)
-        encoded = self.projection(patch_tokens) + self.position_embedding(positions)
-        return encoded
+        self.model_name = model_name
+        self.vit_model = None 
 
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "num_patches": self.num_patches,
-            "projection_dim": self.projection_dim,
-        })
-        return config
+    def build(self, input_shape):
+        if self.vit_model is None:
+            # 1. Tải cấu hình ViT
+            config = ViTConfig.from_pretrained(self.model_name)
+            
+            # 2. Khởi tạo TFViTModel từ Config (tạo model từ scratch)
+            self.vit_model = TFViTModel(config, name='vit_transfer')
+            self.vit_model.config.output_hidden_states = True
+            self.vit_model.config.output_attentions = False
+            
+        super().build(input_shape)
 
+    def call(self, inputs):
+        # inputs phải là (N, C, H, W)
+        outputs = self.vit_model(pixel_values=inputs, training=False)
+        return outputs.pooler_output
 
-# --- Transformer Encoder Block ---
-def transformer_encoder(inputs):
-    x = layers.LayerNormalization(epsilon=1e-6)(inputs)
-    attn = layers.MultiHeadAttention(
-        num_heads=NUM_HEADS, 
-        key_dim=PROJECTION_DIM, 
-        dropout=0.1
-    )(x, x)
-    attn = layers.Dropout(0.1)(attn)
-    x = layers.Add()([attn, inputs])
+# =================================================================
+# 3. HÀM XÂY DỰNG KIẾN TRÚC FEATURE EXTRACTOR
+# =================================================================
+def build_feature_extractor_architecture():
+    """Xây dựng kiến trúc Feature Extractor đúng như trong code training."""
+    
+    inputs = layers.Input(shape=INPUT_SHAPE, name='pixel_values')
+    
+    x = layers.Normalization(
+        mean=[0.5, 0.5, 0.5],
+        variance=[0.25, 0.25, 0.25]
+    )(inputs)
 
-    # FFN
-    y = layers.LayerNormalization(epsilon=1e-6)(x)
-    y = layers.Dense(MLP_UNITS[0], activation='gelu')(y)
-    y = layers.Dropout(0.1)(y)
-    y = layers.Dense(PROJECTION_DIM)(y)
-    return layers.Add()([x, y])
-
-# --- Build ViT model ---
-def build_vit(input_shape=INPUT_SHAPE, num_classes=NUM_CLASSES):
-    inputs = layers.Input(shape=input_shape)
-
-    # 1) Make patches
-    patches = PatchLayer()(inputs) 
-
-    # 2) Patch encoding 
-    patch_embeddings = PatchEncoder()(patches)
-
-    # 3) class token variable (trainable)
-    class_token = tf.Variable(
-        tf.zeros((1, 1, PROJECTION_DIM)), 
-        trainable=True, 
-        name="class_token"
+    x = layers.Permute((3, 1, 2))(x)
+    
+    vit_feature_layer = ViTFeatureExtractorLayer(model_name=PRETRAINED_MODEL)
+    features_vit = vit_feature_layer(x) 
+    
+    # Các lớp Dense dùng để trích xuất features cuối cùng
+    features = layers.Dense(256, activation="gelu", name="feature_dense_1")(features_vit)
+    features = layers.Dropout(0.5, name="feature_dropout_1")(features)
+    features = layers.Dense(128, activation="gelu", name="feature_dense_2")(features)
+    
+    feature_extractor = tf.keras.Model(
+        inputs=inputs,
+        outputs=features,
+        name="ViT_Transfer_FeatureExtractor"
     )
+    return feature_extractor
 
-    # 4) use a Lambda layer to repeat & concat class token
-    def _prepend_token(patch_emb):
-        batch = tf.shape(patch_emb)[0]
-        tokens = tf.repeat(class_token, repeats=batch, axis=0)
-        return tf.concat([tokens, patch_emb], axis=1)
-
-    x = layers.Lambda(_prepend_token, name="prepend_class_token")(patch_embeddings)
-
-    # 5) Transformer encoder stacks
-    for i in range(TRANSFORMER_LAYERS):
-        x = transformer_encoder(x)
-
-    # 6) Take class token output (index 0)
-    x = layers.LayerNormalization(epsilon=1e-6, name="pre_head_ln")(x[:, 0])
-
-    # 7) MLP head
-    for units in MLP_HEAD_UNITS:
-        x = layers.Dense(units, activation="gelu")(x)
-        x = layers.Dropout(0.2)(x)
-
-    outputs = layers.Dense(num_classes, activation="softmax", name="predictions")(x)
-
-    return tf.keras.Model(inputs=inputs, outputs=outputs, name="ViT_Flowers")
-
-# --- TẢI MÔ HÌNH CHUNG ---
+# =================================================================
+# 4. HÀM TẢI MÔ HÌNH VÀ SCALER (SỬ DỤNG CACHING)
+# =================================================================
 @st.cache_resource
-def load_model(model_name):
-    path = MODEL_PATHS[model_name]
+def load_feature_extractor():
+    """Tải và cache Feature Extractor Model (TF Model lớn)."""
+    st.write("Đang xây dựng kiến trúc ViT Feature Extractor...")
+    feature_extractor = build_feature_extractor_architecture()
     
-    if model_name.startswith("ViT"):
-        try:
-            input_shape = (IMAGE_SIZE, IMAGE_SIZE, 3) 
-            num_classes = len(CLASS_NAMES)
-            
-            # Xây dựng lại kiến trúc mô hình ViT
-            model = build_vit(input_shape, num_classes)
-            model.load_weights(path)
-            return model
-        except Exception as e:
-            st.error(f"Lỗi Tải Trọng Số ViT: {e}. Kiến trúc không khớp.")
-            print(f"[LỖI TẢI VIT] Chi tiết: {e}")
-            return None
-            
-    elif model_name.startswith("BoVW"):
-        try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
-            kmeans = data["kmeans"]
-            scaler = data["scaler"]
-            pca = data["pca"]
-            svm_model = data["model"]
-            class_names = data["class_names"]
-            K = data["K_value"]
+    st.write("Đang tải ViT Feature Extractor weights đã lưu...")
+    try:
+        if not os.path.exists(FEATURE_EXTRACTOR_WEIGHTS_PATH):
+            raise FileNotFoundError(f"Không tìm thấy file weights: {FEATURE_EXTRACTOR_WEIGHTS_PATH}")
+        feature_extractor.load_weights(FEATURE_EXTRACTOR_WEIGHTS_PATH)
+        st.success("Tải ViT Feature Extractor weights thành công!")
+        return feature_extractor
+    except Exception as e:
+        st.error(f"❌ Lỗi tải ViT weights: {e}")
+        return None
 
-            return (kmeans, scaler, pca, svm_model, class_names, K)
-                 
-        except Exception as e:
-            st.error(f"Lỗi Tải Mô Hình BoVW: {e}. Vui lòng kiểm tra lại cấu trúc file .pkl.")
-            print(f"[LỖI TẢI BOVW] Chi tiết: {e}")
-            return None
-    return None
-
-# --- HÀM DỰ ĐOÁN CHUNG ---
-def predict_image(model_name, model_obj, image, size, class_names):
+@st.cache_data
+def load_svm_and_scaler():
+    """Tải và cache SVM và Scaler (các đối tượng pickle)."""
     
-    results = []
-    
-    if model_name.startswith("ViT"):
-        # ********* LOGIC DỰ ĐOÁN VIT *********
-        img_resized = image.resize((size, size)).convert('RGB')
+    # Tải SVM Classifier
+    st.write("Đang tải SVM Classifier...")
+    try:
+        if not os.path.exists(SVM_MODEL_PATH):
+            raise FileNotFoundError(f"Không tìm thấy file SVM: {SVM_MODEL_PATH}")
+        with open(SVM_MODEL_PATH, 'rb') as f:
+            svm_model = pickle.load(f)
+        st.success("Tải SVM model thành công!")
+    except Exception as e:
+        st.error(f"❌ Lỗi tải SVM model: {e}")
+        return None, None
 
-        img_array = keras.preprocessing.image.img_to_array(img_resized) 
-        img_array = np.expand_dims(img_array, axis=0) 
-        img_array = img_array / 255.0 
+    # Tải StandardScaler
+    st.write("Đang tải StandardScaler...")
+    try:
+        if not os.path.exists(SCALER_PATH):
+            raise FileNotFoundError(f"Không tìm thấy file Scaler: {SCALER_PATH}")
+        with open(SCALER_PATH, 'rb') as f:
+            scaler = pickle.load(f)
+        st.success("Tải StandardScaler thành công!")
+    except Exception as e:
+        st.error(f"❌ Lỗi tải StandardScaler: {e}")
+        return None, None
         
-        predictions = model_obj.predict(img_array)
-        
-        # Lấy xác suất
-        results = [{'class': name, 'probability': prob} for name, prob in zip(class_names, predictions[0])]
-        
-    elif model_name.startswith("BoVW"):
-        # ********* LOGIC DỰ ĐOÁN BOVW *********
-        # kmeans, scaler, pca, svm_model, class_names, K = model_obj
-            
-        # Chuyển đổi PIL sang cv2 (numpy BGR)
-        img_array = np.array(image.convert('RGB')) # Đảm bảo là RGB trước khi sang numpy
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        
-        # --- TRÍCH XUẤT ĐẶC TRƯNG BOVW + HSV ---
-        features = process_image_for_prediction(img_bgr, model_obj)
-            
-        # --- THỰC HIỆN DỰ ĐOÁN ---
-        probabilities = model_obj[3].predict_proba(features)[0]
-
-        results = [{'class': name, 'probability': prob} for name, prob in zip(class_names, probabilities)]   
-    return results
-
+    return svm_model, scaler
 
 # =================================================================
-# 4. GIAO DIỆN STREAMLIT
+# 5. HÀM TIỀN XỬ LÝ VÀ DỰ ĐOÁN
 # =================================================================
+def preprocess_image(image):
+    """Tiền xử lý ảnh cho ViT."""
+    img = image.resize((IMG_WIDTH, IMG_HEIGHT))
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    img_tensor = tf.expand_dims(img_array, 0)
+    return img_tensor
 
-st.title("🌺 Demo Phân Loại Hoa Đa Mô Hình")
-st.markdown("Chọn một mô hình (ViT hoặc BoVW) và tải lên ảnh để kiểm tra kết quả phân loại.")
+def predict_class(image_tensor, feature_extractor, scaler, svm_model, class_names):
+    """Trích xuất features, chuẩn hóa và dự đoán bằng SVM."""
+    # Trích xuất Features (chỉ chạy inference)
+    features = feature_extractor.predict(image_tensor, verbose=0)
+    
+    # Chuẩn hóa Features
+    features_scaled = scaler.transform(features)
+    
+    # Dự đoán bằng SVM
+    pred_class_index = svm_model.predict(features_scaled)[0]
+    
+    return class_names[pred_class_index], pred_class_index
 
-# 4a. Thanh chọn mô hình
-selected_model_name = st.selectbox(
-    "Chọn Mô Hình Phân Loại:",
-    list(MODEL_PATHS.keys())
+# =================================================================
+# 6. GIAO DIỆN STREAMLIT
+# =================================================================
+st.set_page_config(
+    page_title="Demo: ViT + SVM Phân Loại Hoa",
+    layout="centered",
+    initial_sidebar_state="expanded",
 )
 
-# Tải mô hình đã chọn
-model_obj = load_model(selected_model_name)
+st.title("🌺 Demo Phân Loại Hoa: ViT Transfer Learning + SVM")
+st.subheader("Mô hình đã huấn luyện: ViT Feature Extractor + SVM (Kernel RBF)")
+st.markdown("---")
 
-if model_obj is not None:
-    st.success(f"✅ Mô hình **{selected_model_name}** đã được tải thành công.")
+# Tải mô hình bằng các hàm cache đã tách biệt
+feature_extractor = load_feature_extractor()
+svm_model, scaler = load_svm_and_scaler()
 
+if feature_extractor is None or svm_model is None or scaler is None:
+    st.error("❌ Không thể tải đủ các thành phần mô hình. Vui lòng kiểm tra lại đường dẫn file và các thông báo lỗi tải ở trên.")
+else:
+    st.success("✅ Tải mô hình thành công. Bắt đầu Demo!")
+    
+    # Upload ảnh
     uploaded_file = st.file_uploader(
-        "Chọn một file ảnh...", 
-        type=["jpg", "jpeg", "png"]
+        "Tải lên một hình ảnh hoa:", 
+        type=["png", "jpg", "jpeg"]
     )
 
     if uploaded_file is not None:
-        # Đọc ảnh từ file đã upload
-        image = Image.open(uploaded_file)
+        # Đọc ảnh
+        image = Image.open(uploaded_file).convert("RGB")
         
-        # Hiển thị ảnh
-        st.image(image, caption='Ảnh đã tải lên', use_container_width=True)
-        st.write("")
+        col1, col2 = st.columns([1, 2])
         
-        # Nút Phân loại
-        if st.button('Phân loại ngay!'):
-            with st.spinner(f'Đang chạy dự đoán bằng {selected_model_name}...'):
-                
-                # Thực hiện dự đoán
-                results = predict_image(selected_model_name, model_obj, image, IMAGE_SIZE, CLASS_NAMES)
-                
-                # Sắp xếp kết quả theo xác suất giảm dần
-                results.sort(key=lambda x: x['probability'], reverse=True)
-                
-                best_pred = results[0]
+        with col1:
+            st.image(image, caption='Ảnh tải lên', use_column_width=True)
 
-                # Hiển thị kết quả chính
-                st.success(f"✅ DỰ ĐOÁN HOÀN TẤT!")
-                st.markdown(f"**Loại Hoa Dự Đoán là:** <span style='font-size: 24px; color: #ff4b4b;'>{best_pred['class'].capitalize()}</span>", unsafe_allow_html=True)
-                st.markdown(f"**Độ tự tin:** `{best_pred['probability']:.2%}`")
-                
-                st.write("---")
+        with col2:
+            st.markdown("### 🔍 Kết quả Dự đoán")
+            
+            # Tiền xử lý
+            with st.spinner('Đang tiền xử lý và trích xuất features...'):
+                image_tensor = preprocess_image(image)
+            
+            # Dự đoán
+            with st.spinner('Đang dự đoán bằng SVM...'):
+                pred_class, pred_index = predict_class(
+                    image_tensor, 
+                    feature_extractor, 
+                    scaler, 
+                    svm_model, 
+                    CLASS_NAMES
+                )
+            
+            # Hiển thị kết quả
+            st.metric(
+                label="Lớp Hoa Dự Đoán:", 
+                value=f"**{pred_class.upper()}**", 
+                delta=None
+            )
+            st.success("🎉 Dự đoán hoàn tất!")
+            
+            st.markdown("---")
+            st.markdown(f"**Thông tin chi tiết:**")
+            st.markdown(f"* **Mô hình Trích xuất:** ViT-base-patch16-224 (Tái tạo kiến trúc)")
+            st.markdown(f"* **Bộ phân loại:** Support Vector Machine (Kernel: RBF)")
 
-                # Hiển thị bảng xác suất chi tiết
-                st.subheader("Bảng Xác Suất Chi Tiết")
-                
-                # Định dạng dữ liệu cho DataFrame
-                df_results = pd.DataFrame([
-                    {'Loại Hoa': r['class'].capitalize(), 'Xác Suất': f"{r['probability']:.2%}"} 
-                    for r in results
-                ])
-                st.dataframe(df_results, use_container_width=True, hide_index=True)
-
-else:
-    # Nếu tải mô hình lỗi, thông báo lỗi cụ thể đã được hiển thị bên trong load_model
-    st.error("⚠️ Ứng dụng không thể khởi động do lỗi tải mô hình. Vui lòng kiểm tra các thông báo lỗi cụ thể.")
+st.markdown("---")
+st.caption("Ứng dụng demo bởi Gemini. Vui lòng đảm bảo `tensorflow`, `transformers`, `scikit-learn` đã được cài đặt.")
