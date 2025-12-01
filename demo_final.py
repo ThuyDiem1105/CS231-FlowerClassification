@@ -129,7 +129,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ========================================
-# LOAD MODEL
+# LOAD MODEL & DATA
 # ========================================
 @st.cache_resource
 def load_model_and_metadata():
@@ -146,6 +146,30 @@ def load_model_and_metadata():
         st.error(f"❌ Lỗi khi tải mô hình: {e}")
         st.info("💡 Đảm bảo các file sau tồn tại:\n- vit_flower_model/\n- model_metadata.pkl")
         return None, None
+
+@st.cache_data
+def load_flower_info():
+    """Load thông tin chi tiết về các loài hoa"""
+    try:
+        import json
+        with open('summarize.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        st.warning("⚠️ Không tìm thấy file summarize.json")
+        return {}
+    except Exception as e:
+        st.error(f"❌ Lỗi khi đọc file summarize.json: {e}")
+        return {}
+
+def parse_flower_info(info_text):
+    """Parse thông tin hoa từ string"""
+    lines = info_text.split('\n')
+    parsed = {}
+    for line in lines:
+        if ':' in line:
+            key, value = line.split(':', 1)
+            parsed[key.strip()] = value.strip()
+    return parsed
 
 # ========================================
 # HÀM PREPROCESS & PREDICT
@@ -235,7 +259,7 @@ def plot_top_prediction_gauge(confidence):
         mode="gauge+number",
         value=confidence,
         domain={'x': [0, 1], 'y': [0, 1]},
-        title={'text': "Độ Tin Cậy", 'font': {'size': 22, 'color': '#c2185b', 'weight': 'bold'}},
+        title={'text': "Độ Tin Cậy", 'font': {'size': 22, 'color': '#c2185b'}},
         number={'suffix': "%", 'font': {'size': 44, 'color': '#c2185b'}},
         gauge={
             'axis': {'range': [None, 100], 'tickwidth': 2, 'tickcolor': "#e91e63"},
@@ -271,11 +295,12 @@ def plot_top_prediction_gauge(confidence):
 def main():
     # Header
     st.markdown("<h1>🌸 Nhận Diện Loài Hoa</h1>", unsafe_allow_html=True)
-    st.markdown("<p class='subtitle'>Sử dụng công nghệ Vision Transformer & SVM</p>", unsafe_allow_html=True)
+    st.markdown("<p class='subtitle'>Sử dụng công nghệ Vision Transformer</p>", unsafe_allow_html=True)
     
-    # Load model
+    # Load model và thông tin hoa
     with st.spinner("⏳ Đang tải mô hình..."):
         model, metadata = load_model_and_metadata()
+        flower_info = load_flower_info()
     
     if model is None or metadata is None:
         st.stop()
@@ -347,7 +372,7 @@ def main():
             st.markdown("""
             **Kiến trúc:** Vision Transformer  
             **Pretrained:** google/vit-base-patch16-224  
-            **Phân loại:** Support Vector Machine  
+            **Phân loại:** Softmax Layer  
             **Kích thước:** 224×224 pixels  
             **Số lớp:** 7 loài hoa
             """)
@@ -380,7 +405,7 @@ def main():
                     if is_valid:
                         st.success("✅ Hoàn thành!")
                     else:
-                        st.warning(f"⚠️ Phát hiện: Không phải hoa / Hoa không nằm trong danh sách 7 loài đã học (độ tin cậy {max_conf:.1f}%)")
+                        st.warning(f"⚠️ Phát hiện: Không phải hoa (độ tin cậy {max_conf:.1f}%)")
         else:
             st.info("👆 Vui lòng tải lên ảnh hoa để bắt đầu nhận diện")
     
@@ -445,7 +470,7 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Gauge
+                # Gauge chart ngay sau prediction
                 st.plotly_chart(
                     plot_top_prediction_gauge(top_pred['confidence']),
                     use_container_width=True
@@ -460,6 +485,99 @@ def main():
                     st.info("👍 **Độ tin cậy tốt.** Kết quả đáng tin cậy.")
                 else:
                     st.warning("⚠️ **Độ tin cậy trung bình.** Ảnh có thể có đặc điểm không rõ ràng hoặc hoa tương tự nhiều loài.")
+                
+                # Hiển thị thông tin chi tiết về loài hoa
+                flower_key = top_pred['class'].lower()
+                if flower_key in flower_info:
+                    info_text = flower_info[flower_key]
+                    info = parse_flower_info(info_text)
+                    
+                    st.markdown("---")
+                    st.markdown("""
+                    <h3 style='color: #c2185b; margin: 15px 0; font-weight: bold; text-align: center;'>
+                        📖 Thông Tin Chi Tiết
+                    </h3>
+                    """, unsafe_allow_html=True)
+                    
+                    # Tạo 2 cột cho layout gọn gàng
+                    col_left, col_right = st.columns(2)
+                    
+                    with col_left:
+                        # Tên khoa học
+                        if 'Tên khoa học' in info:
+                            st.markdown(f"""
+                            <div style='background: white; padding: 15px; border-radius: 10px; 
+                                        margin-bottom: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+                                        border-left: 4px solid #ff6b9d; height: 100%;'>
+                                <p style='margin: 0; color: #e91e63; font-weight: bold; margin-bottom: 5px;'>
+                                    🔬 Tên khoa học
+                                </p>
+                                <p style='margin: 0; color: #555; font-style: italic;'>
+                                    {info['Tên khoa học']}
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Nguồn gốc
+                        if 'Nguồn gốc' in info:
+                            st.markdown(f"""
+                            <div style='background: white; padding: 15px; border-radius: 10px; 
+                                        margin-bottom: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+                                        border-left: 4px solid #ff85b3; height: 100%;'>
+                                <p style='margin: 0; color: #e91e63; font-weight: bold; margin-bottom: 5px;'>
+                                    🌍 Nguồn gốc
+                                </p>
+                                <p style='margin: 0; color: #555;'>
+                                    {info['Nguồn gốc']}
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Ý nghĩa biểu tượng
+                        if 'Ý nghĩa biểu tượng' in info:
+                            st.markdown(f"""
+                            <div style='background: white; padding: 15px; border-radius: 10px; 
+                                        margin-bottom: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+                                        border-left: 4px solid #ff9ec7; height: 100%;'>
+                                <p style='margin: 0; color: #e91e63; font-weight: bold; margin-bottom: 5px;'>
+                                    💝 Ý nghĩa
+                                </p>
+                                <p style='margin: 0; color: #555;'>
+                                    {info['Ý nghĩa biểu tượng']}
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    
+                    with col_right:
+                        # Đặc điểm
+                        if 'Đặc điểm' in info:
+                            st.markdown(f"""
+                            <div style='background: white; padding: 15px; border-radius: 10px; 
+                                        margin-bottom: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+                                        border-left: 4px solid #ffb3d9; height: 100%;'>
+                                <p style='margin: 0; color: #e91e63; font-weight: bold; margin-bottom: 5px;'>
+                                    ✨ Đặc điểm
+                                </p>
+                                <p style='margin: 0; color: #555;'>
+                                    {info['Đặc điểm']}
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Ứng dụng công dụng
+                        if 'Ứng dụng công dụng' in info:
+                            st.markdown(f"""
+                            <div style='background: white; padding: 15px; border-radius: 10px; 
+                                        margin-bottom: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+                                        border-left: 4px solid #ffc9e3; height: 100%;'>
+                                <p style='margin: 0; color: #e91e63; font-weight: bold; margin-bottom: 5px;'>
+                                    🌿 Công dụng
+                                </p>
+                                <p style='margin: 0; color: #555;'>
+                                    {info['Ứng dụng công dụng']}
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
         else:
             st.markdown("""
             <div class='info-box'>
