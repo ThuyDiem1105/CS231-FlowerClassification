@@ -1,219 +1,230 @@
-import streamlit as st
 import cv2
 import numpy as np
 import pickle
-from PIL import Image
-import io
-import os
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+import json
+import streamlit as st
+from skimage.feature import hog
+from skimage import exposure
+import matplotlib.pyplot as plt
+from pathlib import Path
 
-# --- CẤU HÌNH & HẰNG SỐ ---
-# Các tham số trích xuất đặc trưng CẦN PHẢI GIỐNG HỆT như trong notebook
-K_VALUE = 700
-HSV_BINS = (4, 4, 4) # 4*4*4 = 64 dimensions cho mỗi histogram
-IMG_SIZE = (256, 256)
-sift = cv2.SIFT_create()
+# --- CONSTANTS ---
+JSON_FILE = "summarize.json" 
+# Chỉ giữ lại MODEL_HOG_HSV
+MODEL_HOG_HSV = 'HOG/best_svm_pca_hog_hsv_model.pkl' 
 
-# --- 1. Hàm Tải Model (Đã sửa) ---
-
-@st.cache_resource
-def load_all_components(path='bovw_sift_hsv_svm.pkl'):
-    """Tải tất cả các thành phần (kmeans, scaler, pca, model, names) từ file dictionary."""
+# --- TẢI CÁC THÀNH PHẦN ---
+@st.cache_data(show_spinner=True)
+def load_components(path):
+    """Tải model, scaler, pca, và thông số cần thiết từ file .pkl."""
+    st.write(f"Đang tải model từ: **{path}**...")
     try:
-        if not os.path.exists(path):
-            st.error(f"Lỗi: Không tìm thấy file model tại {path}. Hãy chắc chắn bạn đã chạy bước lưu file trong notebook và đặt file đúng chỗ.")
-            return None, None, None, None, None
-            
         with open(path, 'rb') as f:
-            model_data = pickle.load(f)
-            
-            # Trích xuất các thành phần từ dictionary
-            kmeans = model_data.get('kmeans')
-            scaler = model_data.get('scaler')
-            pca = model_data.get('pca')
-            svm_model = model_data.get('model')
-            class_names = model_data.get('class_names')
-            
-            # Kiểm tra tính toàn vẹn
-            if None in [kmeans, scaler, pca, svm_model, class_names]:
-                st.error("Lỗi: File model không chứa đủ các thành phần (kmeans, scaler, pca, model, class_names).")
-                return None, None, None, None, None
-
-            st.success("✅ Model (SVM), Visual Dictionary (KMeans), Scaler, và PCA đã được tải thành công!")
-            return kmeans, scaler, pca, svm_model, class_names
-
+            data = pickle.load(f)
+            return data
+    except FileNotFoundError:
+        st.error(f"Lỗi: Không tìm thấy file model tại {path}")
+        return None
     except Exception as e:
         st.error(f"Lỗi khi tải model: {e}")
-        return None, None, None, None, None
-
-# --- 2. Hàm Trích xuất Đặc trưng (RootSIFT, HSV) ---
-
-def extract_rootsift_descriptors(img_gray, max_kp=500):
-    """Tái tạo chính xác hàm RootSIFT từ notebook."""
-    keypoints, desc = sift.detectAndCompute(img_gray, None)
-    if desc is None:
         return None
 
-    if desc.shape[0] > max_kp:
-        desc = desc[:max_kp]
-        
-    # RootSIFT: L1 normalize + căn bậc hai
-    desc = desc.astype("float32")
-    desc /= (desc.sum(axis=1, keepdims=True) + 1e-7)
-    desc = np.sqrt(desc)
+@st.cache_data
+def load_descriptions(path=JSON_FILE):
+    """Tải mô tả các lớp từ file summarize.json."""
+    try:
+        current_dir = Path(__file__).parent
+        file_path = current_dir / path
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        st.error(f"Lỗi: Không tìm thấy file mô tả tại {path}")
+        return {}
+    except json.JSONDecodeError:
+        st.error(f"Lỗi: File {path} không hợp lệ (JSON Error)")
+        return {}
 
-    return desc
-
-def extract_hsv_hist(img_bgr, bins=HSV_BINS):
-    """Trích xuất 3D HSV histogram (Hellinger) từ toàn bộ ảnh resize."""
-    img_resized = cv2.resize(img_bgr, IMG_SIZE)
-    hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
-
+# --- HÀM TRÍCH XUẤT ĐẶC TRƯNG CHUNG ---
+def extract_color_hist_hsv(img, bins=(8, 8, 8)):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV) 
     hist = cv2.calcHist(
-        [hsv], [0,1,2], None,
-        bins,                       
-        [0,180, 0,256, 0,256]
+        [hsv], [0, 1, 2], None,
+        bins,
+        [0, 180, 0, 256, 0, 256]
     )
-    hist = hist.astype("float32").flatten()
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_L1) 
+    return hist.flatten()
 
-    # Hellinger
-    hist /= (hist.sum() + 1e-7)
-    hist = np.sqrt(hist)
-    return hist
+def extract_hog(img, orientations):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hog_feat, _ = hog(
+        gray,
+        orientations=orientations, 
+        pixels_per_cell=(8, 8),
+        cells_per_block=(2, 2),
+        block_norm="L2-Hys",
+        transform_sqrt=True,
+        feature_vector=True,
+        channel_axis=None,
+        visualize=True
+    )
+    return hog_feat
 
-def extract_center_hsv_hist(img_bgr, bins=HSV_BINS):
-    """Trích xuất 3D HSV histogram (Hellinger) từ ô giữa ảnh."""
-    h, w = img_bgr.shape[:2]
-    # cắt ô giữa ảnh (1/2 kích thước)
-    x1, x2 = w//4, 3*w//4
-    y1, y2 = h//4, 3*h//4
-    center = img_bgr[y1:y2, x1:x2]
+# Đã loại bỏ extract_bovw_only_feature do chỉ dùng HOG+HSV
 
-    hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv],[0,1,2],None,bins,[0,180,0,256,0,256])
-    hist = hist.astype("float32").flatten()
+# --- HÀM TỔNG HỢP ĐẶC TRƯNG CHÍNH (Đơn giản hóa) ---
+def get_final_feature_vector(img_bgr, model_data):
+    """Thực hiện toàn bộ quá trình: Resize, Trích xuất HOG+HSV, Scale, PCA."""
     
-    # Hellinger
-    hist /= (hist.sum() + 1e-7)
-    hist = np.sqrt(hist)   
-    return hist
+    # Giả định luôn là HOG_HSV
+    feature_type_code = 'HOG_HSV'
+    st.info(f"-> Phát hiện: **Mô hình {feature_type_code}**. Đang trích xuất...")
 
-def image_to_feature_vector(img_bgr, kmeans: MiniBatchKMeans, scaler: StandardScaler, pca: PCA):
-    """
-    Tái tạo toàn bộ quy trình trích xuất và biến đổi feature.
-    Trả về feature vector cuối cùng (sau PCA).
-    """
-    img_resized = cv2.resize(img_bgr, IMG_SIZE)
-    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
-
-    # --- 1. BoVW từ RootSIFT ---
-    desc = extract_rootsift_descriptors(gray)
-    if desc is None:
-        bovw_hist = np.zeros(K_VALUE, dtype=np.float32)
-    else:
-        words = kmeans.predict(desc)
-        bovw_hist, _ = np.histogram(words, bins=np.arange(K_VALUE+1))
-        bovw_hist = bovw_hist.astype("float32")
-        # Hellinger
-        bovw_hist /= (bovw_hist.sum() + 1e-7)
-        bovw_hist = np.sqrt(bovw_hist)
-
-    # --- 2. HSV color feature (Global & Center) ---
-    global_hsv = extract_hsv_hist(img_resized, bins=HSV_BINS) 
-    center_hsv = extract_center_hsv_hist(img_resized, bins=HSV_BINS)
+    scaler = model_data['scaler']
+    pca = model_data['pca']
     
-    # --- 3. Gộp feature ---
-    feat = np.hstack([bovw_hist, global_hsv, center_hsv]) # K + 64 + 64 = 828 dims
-    feat = feat.reshape(1, -1) # Đảm bảo là mảng 2D
-
-    # --- 4. Chuẩn hóa (StandardScaler) ---
-    feats_scaled = scaler.transform(feat)
-
-    # --- 5. Giảm chiều (PCA) ---
-    feats_pca = pca.transform(feats_scaled)
+    # KIỂM TRA AN TOÀN CHO THAM SỐ MODEL
+    resize_shape = model_data.get('img_size', (128, 128)) 
+    orientations = model_data.get('orientations', 9) 
     
-    return feats_pca
+    img_resized = cv2.resize(img_bgr, resize_shape)
+    img_resized = np.ascontiguousarray(img_resized) 
+
+    hog_feat = extract_hog(img_resized, orientations=orientations)
+    color_feat = extract_color_hist_hsv(img_resized)
+    
+    # Nối HOG và HSV
+    features = np.hstack([hog_feat, color_feat])
+    features = features.reshape(1, -1)
+    
+    features_scaled = scaler.transform(features)
+    features_pca = pca.transform(features_scaled)
+    
+    return features_pca, feature_type_code, img_resized
+
+# --- HÀM XỬ LÝ DỰ ĐOÁN VÀ HIỂN THỊ KẾT QUẢ ---
+def run_prediction(image_bgr, model_data, descriptions):
+    """Hàm xử lý dự đoán và hiển thị kết quả cho Streamlit (chỉ HOG+HSV)."""
+    
+    # Chạy trích xuất đặc trưng (không cần model_choice)
+    feature_vector_pca, feature_type_used, img_to_visualize = get_final_feature_vector(image_bgr, model_data)
+    
+    if feature_vector_pca is None:
+        return
+        
+    svm_model = model_data['model']
+    class_names = model_data['class_names']
+    
+    prediction_index = svm_model.predict(feature_vector_pca)[0]
+    predicted_class = class_names[prediction_index]
+    
+    probabilities = svm_model.predict_proba(feature_vector_pca)[0]
+    confidence = probabilities[prediction_index] * 100
+    
+    description_text = str(descriptions.get(predicted_class, "Không tìm thấy mô tả chi tiết cho loại hoa này."))
+    
+    # 6. HIỂN THỊ KẾT QUẢ
+    st.markdown("### 🌼 KẾT QUẢ DỰ ĐOÁN")
+    st.success(f"Dự đoán: **{predicted_class.upper()}** (Độ tin cậy: **{confidence:.2f}%**)")
+    st.write(f"Phương pháp Đặc trưng: `{feature_type_used}`")
+    st.write(f"Kích thước vector đặc trưng sau PCA: `{feature_vector_pca.shape[1]}`")
+
+    # Bảng chi tiết xác suất
+    with st.expander("Bảng Xác suất chi tiết"):
+        sorted_indices = np.argsort(probabilities)[::-1]
+        data = {
+            "Loại Hoa": [class_names[i].capitalize() for i in sorted_indices],
+            "Xác suất": [f"{probabilities[i]*100:.2f}%" for i in sorted_indices]
+        }
+        st.table(data)
+        
+    # Mô tả tóm tắt
+    st.markdown("### Mô tả Tóm tắt")
+    description_html = description_text.replace('\n', '<br>')
+    st.markdown(f"**Loại hoa {predicted_class.capitalize()}**: \n > {description_html}", unsafe_allow_html=True)
+        
+    # 7. HIỂN THỊ TRỰC QUAN (Visualization) - CHỈ HOG+HSV
+    st.markdown("### Trực quan hóa (HOG + HSV)")
+    
+    gray_image = cv2.cvtColor(img_to_visualize, cv2.COLOR_BGR2GRAY)
+    model_orientations = model_data.get('orientations', 9)
+
+    # 7.1. Trực quan hóa HOG
+    _, hog_image = hog(
+        gray_image, 
+        orientations=model_orientations, 
+        pixels_per_cell=(8, 8),
+        cells_per_block=(2, 2), 
+        block_norm="L2-Hys",
+        transform_sqrt=True,
+        visualize=True,
+        feature_vector=False
+    )
+    hog_image_rescaled = exposure.rescale_intensity(hog_image, out_range=(0, 255)).astype(np.uint8)
+    
+    # 7.2. Hiển thị biểu đồ HSV 
+    st.markdown("#### Biểu đồ Tần suất Màu HSV (8 bins)")
+    img_hsv = cv2.cvtColor(img_to_visualize, cv2.COLOR_BGR2HSV)
+    colors = ('Hue (0-180)', 'Saturation (0-255)', 'Value (0-255)')
+    ranges = ([0, 180], [0, 256], [0, 256])
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    for i, col in enumerate(colors):
+        hist = cv2.calcHist([img_hsv], [i], None, [8], ranges[i])
+        hist = hist / hist.sum()
+        axes[i].bar(range(8), hist.flatten(), color='gray', alpha=0.7)
+        axes[i].set_title(col)
+        axes[i].set_xlabel('Bins')
+        axes[i].set_xlim([0, 8])
+    
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # 7.3. Hiển thị ảnh gốc và HOG
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption=f'Ảnh gốc (Dự đoán: {predicted_class.capitalize()})', use_container_width=True)
+        
+    with col2:
+        st.image(hog_image_rescaled, caption=f'Đặc trưng HOG (Ảnh sau Resize)', use_container_width=True)
 
 
-# --- 3. Ứng dụng Streamlit ---
-
+# --- HÀM MAIN CHO STREAMLIT ---
 def main():
-    st.set_page_config(page_title="🌸 Hệ thống Phân loại Hoa Demo", layout="centered")
+    st.set_page_config(page_title="Hệ thống Nhận dạng Hoa", layout="wide")
+    st.title("🌺 Hệ thống Nhận dạng Hoa (Flower Classifier)")
+    st.markdown("Demo sử dụng phương pháp rút trích đặc trưng **HOG + HSV** và SVM để phân loại.")
+    st.sidebar.header("Tùy chọn")
     
-    st.title("🌺 Hệ thống Phân loại Hoa Dựa trên Hình ảnh")
-    st.markdown("Sử dụng model **BoVW-RootSIFT + HSV + SVM** đã được huấn luyện.")
-    
-    # Tải Model và các thành phần
-    kmeans, scaler, pca, svm_model, class_names = load_all_components()
-    
-    if svm_model is None:
-        st.stop() # Dừng ứng dụng nếu không tải được model hoặc thiếu thành phần
-
-    uploaded_file = st.file_uploader(
-        "Tải lên hình ảnh hoa (Định dạng: .jpg, .jpeg, .png)", 
-        type=["jpg", "jpeg", "png"]
+    # 1. TẢI ẢNH TỪ MÁY TÍNH
+    uploaded_file = st.sidebar.file_uploader(
+        "Chọn một ảnh hoa để dự đoán...",
+        type=['jpg', 'jpeg', 'png']
     )
-
-    if uploaded_file is not None:
-        try:
-            # 1. Hiển thị hình ảnh (Dùng PIL)
-            image_pil = Image.open(uploaded_file)
-            st.image(image_pil, caption='Hình ảnh được tải lên.', use_container_width=True) # Đã sửa cảnh báo
-            st.write("---")
-            
-            # Chuyển đổi PIL Image sang mảng NumPy (OpenCV format - BGR)
-            # Dùng PIL để tránh lỗi cv2.imdecode như bạn gặp trước đó
-            img_np_rgb = np.array(image_pil)
-            img_bgr = cv2.cvtColor(img_np_rgb, cv2.COLOR_RGB2BGR)
-            
-            if img_bgr is None or img_bgr.size == 0:
-                st.error("Không thể đọc file hình ảnh. Vui lòng thử một file khác.")
-                return
-
-            # 2. Trích xuất Đặc trưng
-            with st.spinner('Đang trích xuất đặc trưng (RootSIFT-BoVW, HSV, Scaling, PCA)...'):
-                feature_vector = image_to_feature_vector(img_bgr, kmeans, scaler, pca)
-
-            if feature_vector is not None:
-                st.success(f"Đã trích xuất đặc trưng thành công. Kích thước vector cuối cùng: {feature_vector.shape[1]}")
-                
-                # 3. Dự đoán
-                with st.spinner('Đang dự đoán loại hoa...'):
-                    # Model được huấn luyện với probability=True
-                    probabilities = svm_model.predict_proba(feature_vector)[0]
-                    prediction = svm_model.predict(feature_vector)[0]
-                    predicted_class_name = class_names[prediction]
-                    
-                    st.balloons()
-                    st.header(f"✨ Kết quả Phân loại: **{predicted_class_name.upper()}**")
-                    
-                    # Hiển thị độ tin cậy
-                    confidence = probabilities[prediction] * 100
-                    st.subheader(f"Độ tin cậy: **{confidence:.2f}%**")
-                    
-                    # Bảng xếp hạng các lớp
-                    st.write("### Độ tin cậy chi tiết:")
-                    
-                    # Sắp xếp theo xác suất giảm dần
-                    sorted_indices = np.argsort(probabilities)[::-1]
-                    
-                    data = []
-                    for i in sorted_indices:
-                        data.append({
-                            'Loại Hoa': class_names[i].capitalize(),
-                            'Xác suất': f'{probabilities[i]*100:.2f}%'
-                        })
-                    
-                    st.table(data)
-                        
-            else:
-                st.error("Không thể trích xuất đặc trưng.")
-
-        except Exception as e:
-            st.error(f"Đã xảy ra lỗi trong quá trình xử lý: {e}")
+    
+    # Tải model HOG+HSV duy nhất
+    model_data = load_components(MODEL_HOG_HSV)
+    descriptions = load_descriptions()
+    
+    if uploaded_file is not None and model_data is not None:
+        
+        # Đọc ảnh từ file upload (dạng Streamlit UploadedFile)
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        # Chuyển đổi thành ảnh OpenCV (BGR)
+        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        
+        st.subheader(f"Ảnh đã Tải lên")
+        st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.markdown("---")
+        
+        # Chạy dự đoán
+        run_prediction(img_bgr, model_data, descriptions) # Bỏ model_choice
+        
+    elif uploaded_file is None:
+        st.warning("Vui lòng tải lên một hình ảnh để bắt đầu dự đoán.")
 
 if __name__ == '__main__':
     main()
