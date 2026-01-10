@@ -372,7 +372,7 @@ def main():
             st.markdown("""
             **Kiến trúc:** Vision Transformer  
             **Pretrained:** google/vit-base-patch16-224  
-            **Phân loại:** Softmax Layer  
+            **Phân loại:** Softmax Classification  
             **Kích thước:** 224×224 pixels  
             **Số lớp:** 7 loài hoa
             """)
