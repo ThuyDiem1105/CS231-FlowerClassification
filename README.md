@@ -1,3 +1,5 @@
+# Cấu trúc đồ án phân loại hoa 
+```text
 ├── flowers/                           # Bộ dữ liệu hình ảnh hoa
 │   ├── train/                         # Dữ liệu huấn luyện mô hình
 │   ├── val/                           # Dữ liệu kiểm chứng (validation)
