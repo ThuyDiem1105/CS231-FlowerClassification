@@ -137,7 +137,7 @@ def load_model_and_metadata():
     try:
         model = tf.saved_model.load('vit_flower_model')
         
-        with open('model_metadata.pkl', 'rb') as f:
+        with open('../model_metadata.pkl', 'rb') as f:
             metadata = pickle.load(f)
         
         return model, metadata
@@ -152,7 +152,7 @@ def load_flower_info():
     """Load thông tin chi tiết về các loài hoa"""
     try:
         import json
-        with open('summarize.json', 'r', encoding='utf-8') as f:
+        with open('../summarize.json', 'r', encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
         st.warning("⚠️ Không tìm thấy file summarize.json")
